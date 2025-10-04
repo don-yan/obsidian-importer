@@ -17,11 +17,11 @@ export abstract class ANConverter {
 }
 
 export type ANConverterType<T extends ANConverter> = {
-	new(importer: AppleNotesImporter, x: any): T;
+	new(importer: AppleNotesImporter, x: any, id?: number): T;
 	protobufType: string;
 };
 
-// SQLite types 
+// SQLite types
 
 export type SQLiteTagSpawned = {
 	get(...query: any[]): Promise<SQLiteRow>;

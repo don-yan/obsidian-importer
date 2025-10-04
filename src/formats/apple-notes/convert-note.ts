@@ -17,6 +17,9 @@ import {
 	ANTableObject
 } from './models';
 
+// New imports for front matter handling (inspired by Notion exporter)
+import { serializeFrontMatter } from '../../util'; // Adjust path to match plugin's util file
+
 const FRAGMENT_SPLIT = /(^\s+|(?:\s+)?\n(?:\s+)?|\s+$)/;
 const NOTE_URI = /applenotes:note\/([-0-9a-f]+)(?:\?ownerIdentifier=.*)?/;
 
@@ -27,6 +30,7 @@ const LIST_STYLES = [
 
 export class NoteConverter extends ANConverter {
 	note: ANNote;
+	notePk?: number; // New: to store the note's Z_PK
 
 	listNumber = 0;
 	listIndent = 0;
@@ -34,9 +38,10 @@ export class NoteConverter extends ANConverter {
 
 	static protobufType = 'ciofecaforensics.Document';
 
-	constructor(importer: AppleNotesImporter, document: ANDocument | ANTableObject) {
+	constructor(importer: AppleNotesImporter, document: ANDocument | ANTableObject, notePk?: number) {
 		super(importer);
 		this.note = document.note;
+		this.notePk = notePk; // New: save the Z_PK passed from the caller
 	}
 
 	parseTokens(): ANFragmentPair[] {
@@ -45,7 +50,7 @@ export class NoteConverter extends ANConverter {
 		let offsetEnd = 0;
 		let tokens = [];
 
-		while (i < this.note.attributeRun.length) {
+		while (i < (this.note.attributeRun?.length ?? 0)) {
 			let attr: ANAttributeRun;
 			let attrText = '';
 			let nextIsSame = true;
@@ -65,7 +70,7 @@ export class NoteConverter extends ANConverter {
 			}
 			while (nextIsSame);
 
-			/* Then, since Obsidian doesn't like formatting crossing new lines or 
+			/* Then, since Obsidian doesn't like formatting crossing new lines or
 			starting/ending at spaces, divide tokens based on that */
 			for (let fragment of attrText.split(FRAGMENT_SPLIT)) {
 				if (!fragment) continue;
@@ -78,44 +83,119 @@ export class NoteConverter extends ANConverter {
 
 	async format(table = false, parentNotePath = ''): Promise<string> {
 		let fragments = this.parseTokens();
+		// debugger;
 		let firstLineSkip = !table && this.importer.omitFirstLine && this.note.noteText.contains('\n');
 		let converted = '';
 
-		for (let j = 0; j < fragments.length; j++) {
-			let { attr, fragment } = fragments[j];
+		if (fragments.length) {
+			for (let j = 0; j < fragments?.length; j++) {
+				let { attr, fragment } = fragments[j];
 
-			if (firstLineSkip) {
-				if (fragment.contains('\n') || attr.attachmentInfo) {
-					firstLineSkip = false;
+				if (firstLineSkip) {
+					if (fragment.contains('\n') || attr.attachmentInfo) {
+						firstLineSkip = false;
+					} else {
+						continue;
+					}
 				}
-				else {
-					continue;
+
+
+				attr.fragment = fragment;
+				attr.atLineStart = j == 0 ? true : fragments[j - 1]?.fragment.contains('\n');
+
+				converted += this.formatMultiRun(attr);
+
+				if (!/\S/.test(attr.fragment) || this.multiRun == ANMultiRun.Monospaced) {
+					converted += attr.fragment;
+				} else if (attr.attachmentInfo) {
+					converted += await this.formatAttachment(attr, parentNotePath);
+				} else if (attr.superscript || attr.underlined || attr.color || attr.font || this.multiRun == ANMultiRun.Alignment) {
+					converted += await this.formatHtmlAttr(attr);
+				} else {
+					converted += await this.formatAttr(attr);
 				}
-			}
-
-			attr.fragment = fragment;
-			attr.atLineStart = j == 0 ? true : fragments[j - 1]?.fragment.contains('\n');
-
-			converted += this.formatMultiRun(attr);
-
-			if (!/\S/.test(attr.fragment) || this.multiRun == ANMultiRun.Monospaced) {
-				converted += attr.fragment;
-			}
-			else if (attr.attachmentInfo) {
-				converted += await this.formatAttachment(attr, parentNotePath);
-			}
-			else if (attr.superscript || attr.underlined || attr.color || attr.font || this.multiRun == ANMultiRun.Alignment) {
-				converted += await this.formatHtmlAttr(attr);
-			}
-			else {
-				converted += await this.formatAttr(attr);
 			}
 		}
-
 		if (this.multiRun != ANMultiRun.None) converted += this.formatMultiRun({} as ANAttributeRun);
 		if (table) converted.replace('\n', '<br>').replace('|', '&#124;');
 
-		return converted.trim();
+		converted = converted.trim();
+
+		if (this.importer.addFrontMatter) {
+			// debugger;
+			// Fetch and prepend front matter
+			const frontMatter: Record<string, any> = await this.getFrontMatter();
+			// console.log(`Add FrontMatter for ${this.notePk}`, frontMatter);
+			converted = serializeFrontMatter(frontMatter) + converted;
+
+		}
+
+		return converted;
+	}
+
+	// New method to fetch front matter data
+	async getFrontMatter(): Promise<Record<string, any>> {
+
+		if (this.notePk === undefined) {
+			console.warn('notePk not provided; skipping front matter');
+			return {};
+		}
+
+		// Query with additional date columns
+		const noteRow = await this.importer.database.get`
+			SELECT ZCREATIONDATE,
+				   ZCREATIONDATE1,
+				   ZCREATIONDATE2,
+				   ZCREATIONDATE3,
+				   ZMODIFICATIONDATE,
+				   ZMODIFICATIONDATE1,
+				   ZPARENT
+			FROM ZICCLOUDSYNCINGOBJECT
+			WHERE Z_PK = ${this.notePk}
+		`;
+
+		if (!noteRow) return {};
+
+		// Use fallback chain for created date
+		const creationTs = noteRow.ZCREATIONDATE3 || noteRow.ZCREATIONDATE2 || noteRow.ZCREATIONDATE1 || noteRow.ZCREATIONDATE || 0;
+		// Use fallback for modified date
+		const modificationTs = noteRow.ZMODIFICATIONDATE1 || noteRow.ZMODIFICATIONDATE || 0;
+
+		const unixOffset = 978307200;
+		const created = new Date((creationTs + unixOffset) * 1000).toISOString();
+		const modified = new Date((modificationTs + unixOffset) * 1000).toISOString();
+
+		// Get folder name from parent
+		let folder = '';
+		if (noteRow.ZPARENT) {
+			const folderRow = await this.importer.database.get`
+				SELECT ZTITLE
+				FROM ZICCLOUDSYNCINGOBJECT
+				WHERE Z_PK = ${noteRow.ZFOLDER}
+			`;
+			folder = folderRow?.ZTITLE || '';
+		}
+		// Get tags (Z_ENT=7, linked via ZNOTE1 to note's Z_PK)
+		const tagRows = await this.importer.database.all`
+			SELECT ZALTTEXT, ZDISPLAYTEXT
+			FROM ZICCLOUDSYNCINGOBJECT
+			WHERE (ZNOTE = ${this.notePk} OR ZNOTE1 = ${this.notePk} OR ZATTACHMENT = ${this.notePk})
+			  AND ZTYPEUTI1 = ${ANAttachment.Hashtag}
+		`;
+		const tags = tagRows.map(row => (row.ZALTTEXT || row.ZDISPLAYTEXT || '').replace(/^#/, '')).filter(Boolean);
+
+		if (tags.length) {
+
+		}
+
+		return {
+			// tags: tags.length ? tags : undefined, // Omit if empty
+			tags: tags.length ? tags : [], // Omit if empty
+			created,
+			modified,
+			folder: folder || undefined,// Omit if empty
+			z_pk: this.notePk
+		};
 	}
 
 	/** Format things that cover multiple ANAttributeRuns. */
@@ -154,14 +234,12 @@ export class NoteConverter extends ANConverter {
 			if (styleType == ANStyleType.Monospaced) {
 				this.multiRun = ANMultiRun.Monospaced;
 				prefix += '\n```\n';
-			}
-			else if (LIST_STYLES.includes(styleType as ANStyleType)) {
+			} else if (LIST_STYLES.includes(styleType as ANStyleType)) {
 				this.multiRun = ANMultiRun.List;
 
 				// Apple Notes lets users start a list as indented, so add a initial non-indented bit to those
 				if (attr.paragraphStyle?.indentAmount) prefix += '\n- &nbsp;\n';
-			}
-			else if (attr.paragraphStyle?.alignment) {
+			} else if (attr.paragraphStyle?.alignment) {
 				this.multiRun = ANMultiRun.Alignment;
 				const val = this.convertAlign(attr?.paragraphStyle?.alignment);
 				prefix += `\n<p style="text-align:${val};margin:0">`;
@@ -207,8 +285,7 @@ export class NoteConverter extends ANConverter {
 			attr.fragment =
 				`<a href="${attr.link}" rel="noopener" class="external-link"` +
 				` target="_blank"${style}>${attr.fragment}</a>`;
-		}
-		else if (style) {
+		} else if (style) {
 			if (attr.link) attr.fragment = await this.getInternalLink(attr.link, attr.fragment);
 
 			attr.fragment = `<span style="${style}">${attr.fragment}</span>`;
@@ -216,8 +293,7 @@ export class NoteConverter extends ANConverter {
 
 		if (attr.atLineStart) {
 			return this.formatParagraph(attr);
-		}
-		else {
+		} else {
 			return attr.fragment;
 		}
 	}
@@ -239,16 +315,14 @@ export class NoteConverter extends ANConverter {
 		if (attr.link && attr.link != attr.fragment) {
 			if (NOTE_URI.test(attr.link)) {
 				attr.fragment = await this.getInternalLink(attr.link, attr.fragment);
-			}
-			else {
+			} else {
 				attr.fragment = `[${attr.fragment}](${attr.link})`;
 			}
 		}
 
 		if (attr.atLineStart) {
 			return this.formatParagraph(attr);
-		}
-		else {
+		} else {
 			return attr.fragment;
 		}
 	}
@@ -303,21 +377,24 @@ export class NoteConverter extends ANConverter {
 			case ANAttachment.Hashtag:
 			case ANAttachment.Mention:
 				row = await this.importer.database.get`
-					SELECT zalttext FROM ziccloudsyncingobject 
+					SELECT zalttext
+					FROM ziccloudsyncingobject
 					WHERE zidentifier = ${attr.attachmentInfo.attachmentIdentifier}`;
 
 				return row.ZALTTEXT;
 
 			case ANAttachment.InternalLink:
 				row = await this.importer.database.get`
-					SELECT ztokencontentidentifier FROM ziccloudsyncingobject 
+					SELECT ztokencontentidentifier
+					FROM ziccloudsyncingobject
 					WHERE zidentifier = ${attr.attachmentInfo.attachmentIdentifier}`;
 
 				return await this.getInternalLink(row.ZTOKENCONTENTIDENTIFIER, undefined, parentNotePath);
 
 			case ANAttachment.Table:
 				row = await this.importer.database.get`
-					SELECT hex(zmergeabledata1) as zhexdata FROM ziccloudsyncingobject 
+					SELECT hex(zmergeabledata1) as zhexdata
+					FROM ziccloudsyncingobject
 					WHERE zidentifier = ${attr.attachmentInfo.attachmentIdentifier}`;
 
 				converter = this.importer.decodeData(row.zhexdata, TableConverter);
@@ -325,14 +402,16 @@ export class NoteConverter extends ANConverter {
 
 			case ANAttachment.UrlCard:
 				row = await this.importer.database.get`
-					SELECT ztitle, zurlstring FROM ziccloudsyncingobject 
+					SELECT ztitle, zurlstring
+					FROM ziccloudsyncingobject
 					WHERE zidentifier = ${attr.attachmentInfo.attachmentIdentifier}`;
 
 				return `[**${row.ZTITLE}**](${row.ZURLSTRING})`;
 
 			case ANAttachment.Scan:
 				row = await this.importer.database.get`
-					SELECT hex(zmergeabledata1) as zhexdata FROM ziccloudsyncingobject 
+					SELECT hex(zmergeabledata1) as zhexdata
+					FROM ziccloudsyncingobject
 					WHERE zidentifier = ${attr.attachmentInfo.attachmentIdentifier}`;
 
 				converter = this.importer.decodeData(row.zhexdata, ScanConverter);
@@ -343,8 +422,8 @@ export class NoteConverter extends ANConverter {
 			case ANAttachment.DrawingLegacy2:
 			case ANAttachment.Drawing:
 				row = await this.importer.database.get`
-					SELECT z_pk, zhandwritingsummary 
-					FROM (SELECT *, NULL AS zhandwritingsummary FROM ziccloudsyncingobject) 
+					SELECT z_pk, zhandwritingsummary
+					FROM (SELECT *, NULL AS zhandwritingsummary FROM ziccloudsyncingobject)
 					WHERE zidentifier = ${attr.attachmentInfo.attachmentIdentifier}`;
 
 				id = row?.Z_PK;
@@ -354,7 +433,8 @@ export class NoteConverter extends ANConverter {
 			// Hundreds of different utis so not in the enum
 			default:
 				row = await this.importer.database.get`
-					SELECT zmedia FROM ziccloudsyncingobject 
+					SELECT zmedia
+					FROM ziccloudsyncingobject
 					WHERE zidentifier = ${attr.attachmentInfo?.attachmentIdentifier}`;
 
 				id = row?.ZMEDIA;
@@ -367,22 +447,28 @@ export class NoteConverter extends ANConverter {
 		}
 
 		const attachment = await this.importer.resolveAttachment(id, attr.attachmentInfo!.typeUti);
+		if (!attachment) {
+			// debugger;
+			return ` **(invalid attachment: [${id}] ${attr.attachmentInfo?.typeUti})** `;
+		}
 		let link = attachment
-			? `\n${this.app.fileManager.generateMarkdownLink(attachment, parentNotePath)}\n` 
+			? `\n${this.app.fileManager.generateMarkdownLink(attachment, parentNotePath)}\n`
 			: ` **(error reading attachment)**`;
-		
+
 		if (this.importer.includeHandwriting && row.ZHANDWRITINGSUMMARY) {
 			link = `\n> [!Handwriting]-\n> ${row.ZHANDWRITINGSUMMARY.replace('\n', '\n> ')}${link}`;
 		}
-		
 		return link;
+
+
 	}
 
 	async getInternalLink(uri: string, name: string | undefined = undefined, parentNotePath = ''): Promise<string> {
 		const identifier = uri.match(NOTE_URI)![1];
 
 		const row = await this.importer.database.get`
-			SELECT z_pk FROM ziccloudsyncingobject 
+			SELECT z_pk
+			FROM ziccloudsyncingobject
 			WHERE zidentifier = ${identifier.toUpperCase()}`;
 
 		let file = await this.importer.resolveNote(row.Z_PK);
@@ -431,8 +517,7 @@ function attrEquals(a: ANAttributeRun, b: ANAttributeRun): boolean {
 		if (a[field.name]?.$type && b[field.name]?.$type) {
 			// Is a child ANAttributeRun
 			if (!attrEquals(a[field.name], b[field.name])) return false;
-		}
-		else {
+		} else {
 			if (a[field.name] != b[field.name]) return false;
 		}
 	}

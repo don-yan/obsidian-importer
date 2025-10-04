@@ -242,5 +242,14 @@ export abstract class FormatImporter {
 		// @ts-ignore
 		return await this.app.fileManager.createNewMarkdownFile(folder, sanitizedName, content);
 	}
+
+	/**
+	 * Optional method to
+	 */
+	async cleanup():Promise<void>{
+		// placeholder
+		console.log("Cleanup Importer");
+		return Promise.resolve();
+	}
 }
 

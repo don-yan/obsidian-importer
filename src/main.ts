@@ -1,6 +1,6 @@
 import { App, Modal, Notice, Plugin, Setting } from 'obsidian';
 import { FormatImporter } from './format-importer';
-import { AppleNotesImporter } from './formats/apple-notes';
+import { AppleNotesImporter, AppleNotesSavedData } from './formats/apple-notes';
 import { Bear2bkImporter } from './formats/bear-bear2bk';
 import { EvernoteEnexImporter } from './formats/evernote-enex';
 import { HtmlImporter } from './formats/html';
@@ -168,7 +168,7 @@ export class ImportContext {
 		this.failed.push(name);
 		this.failedCountEl.setText(this.failed.length.toString());
 
-		console.log('Import failed', name, reason);
+		console.warn('Import failed', name, reason);
 
 		this.importLogEl.createDiv('list-item', el => {
 			el.createSpan({ cls: 'importer-error', text: 'Failed: ' });
@@ -177,6 +177,8 @@ export class ImportContext {
 		importLogEl.scrollTop = importLogEl.scrollHeight;
 		importLogEl.show();
 	}
+
+	// TODO: add reportSummary method
 
 	/**
 	 * Report the current progress. This will update the progress bar as well as changing
@@ -216,6 +218,9 @@ export interface ImporterData {
 		onenote?: {
 			previouslyImportedIDs: string[];
 		};
+		apple?: {
+			importMetadata: Record<string, AppleNotesSavedData>
+		}
 	};
 }
 
@@ -224,6 +229,9 @@ const DEFAULT_DATA: ImporterData = {
 		onenote: {
 			previouslyImportedIDs: [],
 		},
+		apple: {
+			importMetadata: {}, // plain object
+		}
 	},
 };
 
@@ -304,7 +312,7 @@ export default class ImporterPlugin extends Plugin {
 			},
 		});
 
-		this.registerObsidianProtocolHandler('importer-auth',
+		this.registerObsidianProtocolHandler('importer-auth--fork',
 			(data) => {
 				if (this.authCallback) {
 					this.authCallback(data);
@@ -433,14 +441,14 @@ export class ImporterModal extends Modal {
 						let buttonsEl = contentEl.createDiv('modal-button-container');
 						let cancelButtonEl = buttonsEl.createEl('button', { cls: 'mod-danger', text: 'Stop' }, el => {
 							el.addEventListener('click', () => {
+								// TODO: Cancel button is not working...
 								ctx.cancel();
 								cancelButtonEl.detach();
 							});
 						});
 						try {
 							await importer.import(ctx);
-						}
-						finally {
+						} finally {
 							if (this.current === ctx) {
 								this.current = null;
 							}
@@ -451,7 +459,9 @@ export class ImporterModal extends Modal {
 							buttonsEl.createEl('button', { cls: 'mod-cta', text: 'Done' }, el => {
 								el.addEventListener('click', () => this.close());
 							});
-							ctx.hideStatus();
+
+							// TODO: do we want to persist the status for the context messages?
+							// ctx.hideStatus(); // TODO: toggle
 						}
 					});
 				});
