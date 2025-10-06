@@ -137,6 +137,7 @@ export class NoteConverter extends ANConverter {
 	async getFrontMatter(): Promise<Record<string, any>> {
 
 		if (this.notePk === undefined) {
+			debugger;
 			console.warn('notePk not provided; skipping front matter');
 			return {};
 		}
@@ -159,11 +160,9 @@ export class NoteConverter extends ANConverter {
 		// Use fallback chain for created date
 		const creationTs = noteRow.ZCREATIONDATE3 || noteRow.ZCREATIONDATE2 || noteRow.ZCREATIONDATE1 || noteRow.ZCREATIONDATE || 0;
 		// Use fallback for modified date
-		const modificationTs = noteRow.ZMODIFICATIONDATE1 || noteRow.ZMODIFICATIONDATE || 0;
-
-		const unixOffset = 978307200;
-		const created = new Date((creationTs + unixOffset) * 1000).toISOString();
-		const modified = new Date((modificationTs + unixOffset) * 1000).toISOString();
+		const modificationTs = noteRow.ZMODIFICATIONDATE1 || noteRow.ZMODIFICATIONDATE || creationTs;
+		const created = new Date(this.importer.decodeTime(creationTs)).toISOString();
+		const modified = new Date(this.importer.decodeTime(modificationTs)).toISOString();
 
 		// Get folder name from parent
 		let folder = '';

@@ -55,6 +55,9 @@ export class AppleNotesImporter extends FormatImporter {
 	private pluginData: ImporterData;
 	private importMetadata: Map<string, AppleNotesSavedData> = new Map();
 
+	// Cache for z_pk to file mappings
+	private zpkCache: Map<string, TFile> = new Map();
+
 	constructor(app: App, modal: ImporterModal) {
 		super(app, modal);
 		// Reset cache for new execution
@@ -109,32 +112,7 @@ export class AppleNotesImporter extends FormatImporter {
 				.setValue(false)
 				.onChange(async v => this.includeHandwriting = v)
 			);
-		/*
 
-				// Settings for filters
-				new Setting(this.modal.contentEl)
-					.setName('Accounts to import')
-					.setDesc(
-						'Comma-separated list of account names to import (case-insensitive, empty for all). ' +
-						'Example: iCloud,Local'
-					)
-					.addText(t => t
-						.onChange(async v => this.accountFilter = v.split(',').map(s => s.trim().toLowerCase()).filter(Boolean))
-					);
-
-				new Setting(this.modal.contentEl)
-					.setName('Folders to import')
-					.setDesc(
-						'Comma-separated list of folder titles to import (case-insensitive, empty for all). ' +
-						'Example: Work,Personal'
-					)
-					.addText(t => t
-							.onChange(async v => this.folderFilter = v.split(',').map(s => s.trim().toLowerCase()).filter(Boolean))
-						// .setValue('test')
-					);
-
-		*/
-		// New setting for front matter
 		new Setting(this.modal.contentEl)
 			.setName('Add YAML front matter')
 			.setDesc(
@@ -143,6 +121,18 @@ export class AppleNotesImporter extends FormatImporter {
 			.addToggle(t => t
 				.onChange(async v => this.addFrontMatter = v)
 				.setValue(true) // TODO: toggle back
+			);
+
+		new Setting(this.modal.contentEl)
+			.setName('Clean up metadata')
+			.setDesc('Remove invalid note metadata from storage.')
+			.addButton(button => button
+				.setButtonText('Clean Up')
+				.onClick(async () => {
+					await this.loadPluginData();
+					await this.cleanupNoteMetadata();
+					new Notice('Note metadata cleaned up successfully.');
+				})
 			);
 
 		// New: Button to load accounts and folders dynamically
@@ -212,6 +202,22 @@ export class AppleNotesImporter extends FormatImporter {
 			);
 	}
 
+	/**
+	 * Clean up noteMetadata by removing entries with invalid file paths.
+	 * @returns {Promise<void>} Resolves when cleanup is complete.
+	 */
+	private async cleanupNoteMetadata(): Promise<void> {
+		let removedCount = 0;
+		for (const [z_pk, metadata] of this.importMetadata) {
+			if (!this.vault.getAbstractFileByPath(metadata.filePath)) {
+				this.importMetadata.delete(z_pk);
+				removedCount++;
+			}
+		}
+		await this.savePluginData();
+		console.log(`Cleaned up ${removedCount} invalid metadata entries.`);
+	}
+
 	async getNotesDatabase(): Promise<SQLiteTagSpawned | null> {
 		const dataPath = path.join(os.homedir(), NOTE_FOLDER_PATH);
 
@@ -271,6 +277,9 @@ export class AppleNotesImporter extends FormatImporter {
 
 		// Load persistent data
 		await this.loadPluginData();
+
+		// Clean up invalid metadata
+		await this.cleanupNoteMetadata();
 
 		// @ts-ignore
 		this.database = await this.getNotesDatabase() as SQLiteTagSpawned;
@@ -337,6 +346,20 @@ export class AppleNotesImporter extends FormatImporter {
 			addFrontMatter: this.addFrontMatter
 		});
 
+
+		// Build z_pk cache for markdown files under rootFolder
+		this.zpkCache.clear();
+		if (this.addFrontMatter) {
+			for (const file of this.app.vault.getMarkdownFiles()) {
+				if (file.path.startsWith(this.rootFolder.path + '/')) {
+					const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
+					if (frontmatter?.z_pk) {
+						this.zpkCache.set(frontmatter.z_pk.toString(), file);
+					}
+				}
+			}
+		}
+
 		// Fetch notes only in filtered folders
 		let notes;
 		if (filteredFolderPks.length > 0) {
@@ -379,16 +402,16 @@ export class AppleNotesImporter extends FormatImporter {
 				if (existingFile) {
 					// Check for rename: Compare basename with sanitized ZTITLE1
 					if (existingFile.basename !== sanitizeFileName(n.ZTITLE1)) {
-						debugger;
+						// debugger;
 						const folder = this.resolvedFolders[n.ZFOLDER] || this.rootFolder;
 						const renamedFile = await this.renameFile(existingFile, n.ZTITLE1, folder) as TFile;
 						this.resolvedFiles[n.Z_PK] = renamedFile;
 						console.log('renaming file', existingFile.path, n.ZTITLE1);
 						this.ctx.reportNoteSuccess(`File Renamed: ${existingFile.path} ==> ${renamedFile.path}`);
-						this.importMetadata.set(n.Z_PK.toString(), {
-							modificationDate: appleModTime,
-							filePath: renamedFile.path
-						});
+						this.importMetadata.set(n.Z_PK.toString(), { modificationDate: appleModTime, filePath: renamedFile.path });
+						if (this.addFrontMatter) {
+							this.zpkCache.set(n.Z_PK.toString(), renamedFile);
+						}
 					}
 
 					// Case a: Apple modified, Obsidian unchanged
@@ -510,7 +533,9 @@ export class AppleNotesImporter extends FormatImporter {
 				   zcreationdate1,
 				   zcreationdate2,
 				   zcreationdate3,
+				   zcreationdate,
 				   zmodificationdate1,
+				   zmodificationdate,
 				   zispasswordprotected
 			FROM zicnotedata AS nd,
 				 (SELECT *,
@@ -529,7 +554,22 @@ export class AppleNotesImporter extends FormatImporter {
 
 		const folder = this.resolvedFolders[row.ZFOLDER] || this.rootFolder;
 		const noteTitle = title || row.ZTITLE1;
-		const file = existingFile || await this.saveAsMarkdownFile(folder, `${sanitizeFileName(noteTitle)}.md`, '');
+		// NOTE: Changed here...
+		// const file = existingFile || await this.saveAsMarkdownFile(folder, `${sanitizeFileName(noteTitle)}.md`, '');
+		let baseName = sanitizeFileName(noteTitle);
+		let filePath = `${folder.path}/${baseName}.md`;
+		let suffix = 1;
+
+		// Check for existing files to avoid conflicts
+		if (!existingFile) {
+			while (this.vault.getAbstractFileByPath(filePath)) {
+				filePath = `${folder.path}/${baseName}-${suffix}.md`;
+				suffix++;
+			}
+		}
+
+		const file = existingFile || await this.saveAsMarkdownFile(folder, path.basename(filePath), '');
+
 
 		this.ctx.status(`Importing note ${noteTitle}`);
 		this.resolvedFiles[id] = file;
@@ -542,8 +582,8 @@ export class AppleNotesImporter extends FormatImporter {
 		try {
 			content = await converter.format(false, file.path);
 			await this.vault.modify(file, content, {
-				ctime: this.decodeTime(row.ZCREATIONDATE3 || row.ZCREATIONDATE2 || row.ZCREATIONDATE1),
-				mtime: this.decodeTime(row.ZMODIFICATIONDATE1)
+				ctime: this.decodeTime(row.ZCREATIONDATE3 || row.ZCREATIONDATE2 || row.ZCREATIONDATE1 || row.ZCREATIONDATE),
+				mtime: this.decodeTime(row.ZMODIFICATIONDATE1 || row.ZMODIFICATIONDATE)
 			});
 			// Update noteMetadata with modificationDate and filePath
 			this.importMetadata.set(id.toString(), {
@@ -727,9 +767,9 @@ export class AppleNotesImporter extends FormatImporter {
 	}
 
 	/**
-	 * Find an existing file by z_pk in metadata or frontmatter.
-	 * @param z_pk The primary key of the note.
-	 * @returns {Promise<TFile | null>} The matching file or null.
+	 * Find an existing file by its Z_PK.
+	 * @param z_pk The note's primary key.
+	 * @returns {Promise<TFile | null>} The file if found, else null.
 	 */
 	private async findExistingFileByZpk(z_pk: number): Promise<TFile | null> {
 		const metadata = this.importMetadata.get(z_pk.toString());
@@ -739,11 +779,11 @@ export class AppleNotesImporter extends FormatImporter {
 				return file;
 			}
 		}
-		// Fallback to scanning resolvedFiles if metadata is missing or path is invalid
-		for (const file of Object.values(this.resolvedFiles)) {
-			const frontmatter = await this.readFrontmatter(file);
-			if (frontmatter?.z_pk?.toString() === z_pk.toString()) {
-				// Update metadata with correct path if found
+
+		// Use zpkCache for frontmatter lookup if addFrontMatter is enabled
+		if (this.addFrontMatter) {
+			const file = this.zpkCache.get(z_pk.toString());
+			if (file) {
 				this.importMetadata.set(z_pk.toString(), {
 					modificationDate: metadata?.modificationDate || 0,
 					filePath: file.path
@@ -751,36 +791,28 @@ export class AppleNotesImporter extends FormatImporter {
 				return file;
 			}
 		}
+
 		return null;
 	}
 
 	/**
-	 * Read frontmatter from a file.
-	 * @param file The file to read.
-	 * @returns {Promise<Record<string, any> | null>} The frontmatter or null if not found.
-	 */
-	private async readFrontmatter(file: TFile): Promise<Record<string, any> | null> {
-		try {
-			const content = await this.vault.read(file);
-			const match = content.match(/^---\n([\s\S]*?)\n---\n/);
-			if (!match) return null;
-			const yaml = require('js-yaml').load(match[1]);
-			return yaml as Record<string, any>;
-		} catch (e) {
-			console.warn(`Failed to read frontmatter for ${file.path}:`, e);
-			return null;
-		}
-	}
-
-	/**
-	 * Rename an existing file to match new title.
+	 * Rename an existing file to match new title, handling duplicates.
 	 * @param file The file to rename.
 	 * @param newTitle The new title.
 	 * @param folder The target folder.
 	 * @returns {Promise<TFile>} The renamed file.
 	 */
 	private async renameFile(file: TFile, newTitle: string, folder: TFolder): Promise<TFile> {
-		const newPath = `${folder.path}/${sanitizeFileName(newTitle)}.md`;
+		let baseName = sanitizeFileName(newTitle);
+		let newPath = `${folder.path}/${baseName}.md`;
+		let suffix = 1;
+
+		// Check for existing files to avoid conflicts
+		while (this.vault.getAbstractFileByPath(newPath) && newPath !== file.path) {
+			newPath = `${folder.path}/${baseName}-${suffix}.md`;
+			suffix++;
+		}
+
 		if (newPath !== file.path) {
 			await this.vault.rename(file, newPath);
 			// Trigger cache refresh to update links
